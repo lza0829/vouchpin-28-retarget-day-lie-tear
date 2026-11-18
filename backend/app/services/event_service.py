@@ -27,7 +27,7 @@ def list_events(business_day: str | None = None) -> list[dict[str, Any]]:
 
 
 def _requested_day(conn, body: dict[str, Any]) -> str:
-    """落库归属（三处同源的源头）：显式 business_day > occurred_at 当日 > 当前业务日。"""
+    """目标归属日（唯一口径的源头）：显式 business_day > occurred_at 当日 > 当前业务日。"""
     day = (body.get("business_day") or "").strip()
     if day:
         return day
@@ -35,24 +35,6 @@ def _requested_day(conn, body: dict[str, Any]) -> str:
     if occurred:
         return occurred[:10]
     return settings_repo.get(conn, "business_day")
-
-
-def _gate_redeem_day(conn, requested: str) -> tuple[str, str | None]:
-    """日闸：目标日已钉则不写入该日，改挂到 [目标日, 当前业务日] 内最早开放日。
-
-    返回 (落库日, retarget_from)；无开放日则 409，什么都不写。
-    调用方须持有 BEGIN IMMEDIATE 事务，使检查与写入相对并发钉扎互斥。
-    """
-    if not fact_repo.day_is_sealed(conn, requested):
-        return requested, None
-    today = settings_repo.get(conn, "business_day")
-    open_day = fact_repo.earliest_open_day(conn, requested, today)
-    if open_day is None:
-        raise HTTPException(
-            409,
-            f"业务日 {requested} 已钉扎，且至当前业务日 {today} 无开放日可改挂，核销未写入",
-        )
-    return open_day, requested
 
 
 def add_event(body: dict[str, Any]) -> dict[str, Any]:
@@ -70,16 +52,19 @@ def add_event(body: dict[str, Any]) -> dict[str, Any]:
             date.fromisoformat(requested)
         except ValueError:
             raise HTTPException(400, f"落库业务日格式非法（须 YYYY-MM-DD）: {requested!r}")
+
         retarget_from = None
-        claim = None
         if et == "redeem":
+            # 日闸唯一入口：已钉则改挂最早开放日，无开放日在此抛 409，
+            # 下面任何 INSERT 都不会发生，事务随连接关闭回滚——无半写。
             from app.services import day_claim
-            occurred_hint = body.get("occurred_at") or ""
-            claim = day_claim.place(conn, requested, occurred_hint)
-            day = claim["event_day"]
+            claim = day_claim.place(conn, requested)
+            day = claim["day"]
             retarget_from = claim["retarget_from"]
         else:
+            # issue/void 不产生核销事实，不受日闸限制
             day = requested
+
         amount = float(body.get("amount") or 0)
         if et == "redeem" and amount <= 0:
             # default face value from campaign
@@ -87,6 +72,8 @@ def add_event(body: dict[str, Any]) -> dict[str, Any]:
             if camp in camps:
                 amount = float(camps[camp]["face_value"])
         occurred = body.get("occurred_at") or datetime.now().replace(microsecond=0).isoformat()
+
+        # 事件入湖与事实归属同一 business_day，同事务提交
         eid = event_repo.insert_event(
             conn,
             event_type=et,
@@ -99,45 +86,31 @@ def add_event(body: dict[str, Any]) -> dict[str, Any]:
             retarget_from=retarget_from,
         )
         fact_id = None
-        receipt_day = day
-        if et == "redeem" and claim is not None:
-            receipt_day = claim["receipt_day"]
-            if claim["half"] or claim["fact_day"] is None:
-                conn.commit()
-                return {
-                    "event_id": eid,
-                    "fact_id": None,
-                    "business_day": receipt_day,
-                    "occurred_at": occurred,
-                    "retargeted": True,
-                    "retarget_from": retarget_from,
-                    "success": True,
-                    "event_day": claim["event_day"],
-                    "fact_day": None,
-                }
+        if et == "redeem":
             try:
                 fact_id = fact_repo.insert_fact(
                     conn,
                     coupon_code=code,
                     campaign_code=camp,
                     amount=amount,
-                    business_day=claim["fact_day"],
+                    business_day=day,
                     event_id=eid,
                     status="open",
                     retarget_from=retarget_from,
                 )
             except Exception as e:
+                # 事实落不下（如券码已核销）：事件一并回滚，禁止事件无事实的半写
+                conn.rollback()
                 raise HTTPException(409, f"核销事实写入失败（可能券码已核销）: {e}") from e
         conn.commit()
+        # 对外回执 = 落库日：回执日、事件折日、事实归属日三者同一日
         return {
             "event_id": eid,
             "fact_id": fact_id,
-            "business_day": receipt_day,
+            "business_day": day,
             "occurred_at": occurred,
             "retargeted": retarget_from is not None,
             "retarget_from": retarget_from,
-            "event_day": claim["event_day"] if claim else day,
-            "fact_day": claim["fact_day"] if claim else day,
             "success": True,
         }
     finally:

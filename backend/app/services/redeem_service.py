@@ -47,17 +47,17 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
         if not opens:
             raise HTTPException(400, "无可钉扎的 open 核销事实")
         total = round(sum(float(f["amount"]) for f in opens), 2)
+        # 批附注与事实同源：改挂笔数/金额按真实改挂事实行重算，
+        # 禁止“迁出来源有值、目标批附注计数为 0”。
         rt_count, rt_total = fact_repo.retarget_stats(opens)
-        from app.services import day_claim
-        posted_count, posted_amount = day_claim.zero_retarget(rt_count, rt_total)
         bid = batch_repo.create_batch(
             conn,
             business_day=day,
             status="sealed",
             fact_count=len(opens),
             total_amount=total,
-            retarget_count=posted_count,
-            retarget_amount=posted_amount,
+            retarget_count=rt_count,
+            retarget_amount=rt_total,
             sealed_at=datetime.now().replace(microsecond=0).isoformat(),
             note=body.get("note") or "",
         )
@@ -68,8 +68,8 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
             "business_day": day,
             "fact_count": len(opens),
             "total_amount": total,
-            "retarget_count": posted_count,
-            "retarget_amount": posted_amount,
+            "retarget_count": rt_count,
+            "retarget_amount": rt_total,
             "status": "sealed",
         }
     finally:

@@ -71,17 +71,3 @@ def retarget_stats(facts: list[dict[str, Any]]) -> tuple[int, float]:
     """给定一组事实，数出其中改挂笔数与金额（预览与批快照同源）。"""
     rt = [f for f in facts if f.get("retarget_from")]
     return len(rt), round(sum(float(f["amount"]) for f in rt), 2)
-
-
-def count_on_day(conn: sqlite3.Connection, business_day: str, retarget_from: str | None = None) -> int:
-    if retarget_from:
-        row = conn.execute(
-            "SELECT COUNT(*) c FROM redeem_facts WHERE business_day=? AND retarget_from=?",
-            (business_day, retarget_from),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(*) c FROM redeem_facts WHERE business_day=? AND retarget_from IS NOT NULL",
-            (business_day,),
-        ).fetchone()
-    return int(row["c"])
